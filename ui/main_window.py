@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QListWidget,
     QListWidgetItem,
+    QMenu,
 )
 
 from i18n.i18n import tr, get_lang
@@ -337,18 +338,24 @@ class MainWindow(QMainWindow):
         idx = self.table.indexAt(pos)
         if not idx.isValid():
             return
+
+        # Do not allow rescan while scan is running
         if self.stop_btn.isEnabled():
             QMessageBox.information(self, "Info", tr("msg_scan_running", self.lang))
             return
 
+        # Get selected IP
         src_idx = self.proxy.mapToSource(idx)
         ip = self.model._rows[src_idx.row()].ip
 
-        act = QAction(tr("context_rescan", self.lang), self)
-        act.triggered.connect(lambda: self._do_rescan(ip))
+        # ✅ Correct custom menu
+        menu = QMenu(self)
 
-        menu = self.table.createStandardContextMenu()
-        menu.addAction(act)
+        act_rescan = QAction(tr("context_rescan", self.lang), self)
+        act_rescan.triggered.connect(lambda: self._do_rescan(ip))
+
+        menu.addAction(act_rescan)
+
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _do_rescan(self, ip: str) -> None:
