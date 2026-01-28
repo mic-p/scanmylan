@@ -1,15 +1,12 @@
-"""OS detection utilities."""
-
 from __future__ import annotations
-import platform
+import sys
 
-
-def get_os() -> str:
-    sysname = platform.system().lower()
-    if "windows" in sysname:
+def platform_name() -> str:
+    # Normalized platform name.
+    if sys.platform.startswith("win"):
         return "windows"
-    if "linux" in sysname:
+    if sys.platform.startswith("linux"):
         return "linux"
-    if "darwin" in sysname or "mac" in sysname:
+    if sys.platform.startswith("darwin"):
         return "darwin"
     return "other"

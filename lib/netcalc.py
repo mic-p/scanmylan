@@ -1,50 +1,35 @@
-"""Network calculation using ipaddress.
-
-Input:
-- IPv4 CIDR (e.g. 192.168.1.0/24)
-- single IPv4 address is accepted and treated as /32
-
-Output:
-- list of host IP strings (excluding network & broadcast)
-- ip_start/ip_stop/broadcast for UI display
-"""
-
 from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass
-from typing import List
 
-
-@dataclass
+@dataclass(frozen=True)
 class NetInfo:
-    network_cidr: str
+    network: str
     ip_start: str
     ip_stop: str
     broadcast: str
-    hosts: List[str]
-
+    hosts: list[str]
 
 def parse_network(text: str) -> NetInfo:
-    raw = (text or "").strip()
-    if not raw:
+    # IPv4 CIDR only. If single IPv4 is provided, treat as /32.
+    text = (text or "").strip()
+    if not text:
         raise ValueError("empty")
-
-    # Accept single IP and treat as /32
-    if "/" not in raw:
-        raw = f"{raw}/32"
-
-    net = ipaddress.IPv4Network(raw, strict=False)
-
-    hosts = [str(h) for h in net.hosts()]  # excludes network & broadcast
+    if "/" not in text:
+        text = f"{text}/32"
+    net = ipaddress.ip_network(text, strict=False)
+    if not isinstance(net, ipaddress.IPv4Network):
+        raise ValueError("IPv4 only")
+    hosts = [str(h) for h in net.hosts()]
+    if net.prefixlen == 32:
+        hosts = [str(net.network_address)]
     ip_start = hosts[0] if hosts else str(net.network_address)
     ip_stop = hosts[-1] if hosts else str(net.broadcast_address)
-    broadcast = str(net.broadcast_address)
-
     return NetInfo(
-        network_cidr=str(net.with_prefixlen),
+        network=str(net),
         ip_start=ip_start,
         ip_stop=ip_stop,
-        broadcast=broadcast,
+        broadcast=str(net.broadcast_address),
         hosts=hosts,
     )

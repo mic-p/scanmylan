@@ -1,190 +1,203 @@
-"""Scanning engine.
-
-Pipeline per IP (only if ping is alive):
-A+B) ping with retries, concurrency = num_process
-C) fqdn (optional)
-D) arp lookup (optional) immediately after the ping success
-E) vendor lookup (optional) immediately after mac was found
-
-Stop behavior:
-- sets a stop event
-- terminates and kills all running ping subprocesses
-- worker functions should check the stop event between steps
-"""
-
 from __future__ import annotations
 
 import socket
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 from .icmp import popen_ping, DEFAULT_TIMEOUT_SEC, DEFAULT_ECHO_COUNT
 from .arp import get_mac_for_ip
-from .vendor import lookup_vendor
+from .vendor import vendor_from_mac
 
+# Scanning pipeline per IP:
+# 1) Ping (with retries)
+# 2) If alive: FQDN (optional)
+# 3) If alive: ARP (optional) - immediately after successful ping
+# 4) If alive and MAC exists: Vendor (optional) - immediately after ARP
+#
+# Stop:
+# - Set stop event
+# - Terminate and kill all running ping subprocesses
+# - Workers stop as soon as possible
 
 @dataclass
-class HostResult:
+class ScanResult:
     ip: str
-    alive: bool
+    alive: bool = False
     fqdn: str = ""
     mac: str = ""
     vendor: str = ""
 
+@dataclass
+class ScanConfig:
+    title: str
+    network: str
+    ip_start: str
+    ip_stop: str
+    broadcast: str
+    num_process: int = 5
+    num_run: int = 2
+    flag_fqdn: bool = True
+    flag_arp: bool = True
+    flag_vendor: bool = True
 
-class ScannerEngine:
+class LanScanner:
     def __init__(
         self,
-        *,
-        num_process: int = 5,
-        num_run: int = 2,
-        flag_fqdn: bool = True,
-        flag_arp: bool = True,
-        flag_vendor: bool = True,
-        ping_timeout_sec: int = DEFAULT_TIMEOUT_SEC,
-        ping_echo_count: int = DEFAULT_ECHO_COUNT,
-    ):
-        self.num_process = int(num_process)
-        self.num_run = int(num_run)
-        self.flag_fqdn = bool(flag_fqdn)
-        self.flag_arp = bool(flag_arp)
-        self.flag_vendor = bool(flag_vendor)
-        self.ping_timeout_sec = int(ping_timeout_sec)
-        self.ping_echo_count = int(ping_echo_count)
+        ips: List[str],
+        config: ScanConfig,
+        on_host: Optional[Callable[[ScanResult], None]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        on_state: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.ips = ips
+        self.config = config
+        self.on_host = on_host
+        self.on_progress = on_progress
+        self.on_state = on_state
 
         self._stop_evt = threading.Event()
-        self._procs_lock = threading.Lock()
-        self._running_procs = set()  # type: ignore[var-annotated]
+        self._lock = threading.Lock()
+        self._running_procs: Dict[str, object] = {}
 
     def stop(self) -> None:
         self._stop_evt.set()
-        # Kill all running ping processes
-        with self._procs_lock:
-            procs = list(self._running_procs)
-
+        with self._lock:
+            procs = list(self._running_procs.values())
         for p in procs:
             try:
                 p.terminate()
             except Exception:
                 pass
-
-        # Give a very short grace period, then hard kill
-        time.sleep(0.1)
         for p in procs:
             try:
-                if p.poll() is None:
-                    p.kill()
+                p.kill()
             except Exception:
                 pass
 
-    def is_stopped(self) -> bool:
-        return self._stop_evt.is_set()
+    def _emit_state(self, s: str) -> None:
+        if self.on_state:
+            try:
+                self.on_state(s)
+            except Exception:
+                pass
 
-    def _register_proc(self, p) -> None:
-        with self._procs_lock:
-            self._running_procs.add(p)
+    def _emit_progress(self, done: int, total: int) -> None:
+        if self.on_progress:
+            try:
+                self.on_progress(done, total)
+            except Exception:
+                pass
 
-    def _unregister_proc(self, p) -> None:
-        with self._procs_lock:
-            self._running_procs.discard(p)
+    def _emit_host(self, r: ScanResult) -> None:
+        if self.on_host:
+            try:
+                self.on_host(r)
+            except Exception:
+                pass
 
     def _ping_with_retries(self, ip: str) -> bool:
-        # Retry logic: up to num_run times when return code != 0
-        for _ in range(max(1, self.num_run)):
-            if self.is_stopped():
+        for _ in range(int(self.config.num_run)):
+            if self._stop_evt.is_set():
                 return False
-            p = popen_ping(ip, timeout_sec=self.ping_timeout_sec, echo_count=self.ping_echo_count)
-            self._register_proc(p)
+            p = popen_ping(ip, timeout_sec=DEFAULT_TIMEOUT_SEC, echo_count=DEFAULT_ECHO_COUNT)
+            with self._lock:
+                self._running_procs[ip] = p
             try:
-                rc = p.wait()
+                rc = p.wait(timeout=DEFAULT_TIMEOUT_SEC * (DEFAULT_ECHO_COUNT + 1) + 1)
+                ok = (rc == 0)
+            except Exception:
+                ok = False
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                try:
+                    p.kill()
+                except Exception:
+                    pass
             finally:
-                self._unregister_proc(p)
-
-            if rc == 0:
+                with self._lock:
+                    self._running_procs.pop(ip, None)
+            if ok:
                 return True
         return False
 
-    def _resolve_fqdn(self, ip: str) -> str:
-        if not self.flag_fqdn or self.is_stopped():
+    def _fqdn(self, ip: str) -> str:
+        if not self.config.flag_fqdn or self._stop_evt.is_set():
             return ""
-        # Keep DNS lookups bounded
-        old = socket.getdefaulttimeout()
         try:
-            socket.setdefaulttimeout(2.0)
+            old = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(2)
             try:
                 return socket.gethostbyaddr(ip)[0] or ""
-            except Exception:
-                return ""
-        finally:
-            socket.setdefaulttimeout(old)
+            finally:
+                socket.setdefaulttimeout(old)
+        except Exception:
+            return ""
 
-    def _resolve_arp_mac(self, ip: str) -> str:
-        if not self.flag_arp or self.is_stopped():
+    def _arp_mac(self, ip: str) -> str:
+        if not self.config.flag_arp or self._stop_evt.is_set():
             return ""
         try:
             return get_mac_for_ip(ip) or ""
         except Exception:
             return ""
 
-    def _resolve_vendor(self, mac: str) -> str:
-        if not self.flag_vendor or self.is_stopped() or not mac:
+    def _vendor(self, mac: str) -> str:
+        if not self.config.flag_vendor or self._stop_evt.is_set():
             return ""
         try:
-            return lookup_vendor(mac) or ""
+            return vendor_from_mac(mac) or ""
         except Exception:
             return ""
 
-    def scan_one(self, ip: str) -> HostResult:
-        # This method is used both by bulk scan and by GUI "Re-scan".
-        alive = self._ping_with_retries(ip)
-        if self.is_stopped():
-            return HostResult(ip=ip, alive=False)
+    def _scan_one(self, ip: str) -> ScanResult:
+        r = ScanResult(ip=ip)
+        if self._stop_evt.is_set():
+            return r
 
-        if not alive:
-            return HostResult(ip=ip, alive=False)
+        r.alive = self._ping_with_retries(ip)
+        if not r.alive or self._stop_evt.is_set():
+            return r
 
-        fqdn = self._resolve_fqdn(ip)
-        mac = self._resolve_arp_mac(ip)
-        vendor = self._resolve_vendor(mac)
+        r.fqdn = self._fqdn(ip)
+        if self._stop_evt.is_set():
+            return r
 
-        return HostResult(ip=ip, alive=True, fqdn=fqdn, mac=mac, vendor=vendor)
+        r.mac = self._arp_mac(ip)
+        if self._stop_evt.is_set():
+            return r
 
-    def scan_many(
-        self,
-        ips: Iterable[str],
-        *,
-        on_host: Optional[Callable[[HostResult], None]] = None,
-        on_progress: Optional[Callable[[int, int], None]] = None,
-        on_state: Optional[Callable[[str], None]] = None,
-    ) -> List[HostResult]:
-        ips_list = list(ips)
-        total = len(ips_list)
+        if r.mac:
+            r.vendor = self._vendor(r.mac)
+
+        return r
+
+    def run(self) -> List[ScanResult]:
+        total = len(self.ips)
         done = 0
-        results: Dict[str, HostResult] = {}
+        results: List[ScanResult] = []
+        self._emit_state("ping")
 
-        if on_state:
-            on_state("ping+details")
-
-        with ThreadPoolExecutor(max_workers=self.num_process) as ex:
-            fut_map = {ex.submit(self.scan_one, ip): ip for ip in ips_list}
-            for fut in as_completed(fut_map):
-                if self.is_stopped():
+        with ThreadPoolExecutor(max_workers=int(self.config.num_process)) as ex:
+            futs = {ex.submit(self._scan_one, ip): ip for ip in self.ips}
+            for fut in as_completed(futs):
+                if self._stop_evt.is_set():
                     break
-                ip = fut_map[fut]
                 try:
-                    res = fut.result()
+                    r = fut.result()
                 except Exception:
-                    res = HostResult(ip=ip, alive=False)
-
-                results[ip] = res
+                    r = ScanResult(ip=futs[fut], alive=False)
+                results.append(r)
+                self._emit_host(r)
                 done += 1
-                if on_host:
-                    on_host(res)
-                if on_progress:
-                    on_progress(done, total)
+                self._emit_progress(done, total)
 
-        # Return results in the original IP order
-        return [results.get(ip, HostResult(ip=ip, alive=False)) for ip in ips_list]
+        return results
+
+    def scan_single(self, ip: str) -> ScanResult:
+        # Single-host scan for GUI context menu.
+        self._stop_evt.clear()
+        return self._scan_one(ip)

@@ -1,150 +1,129 @@
-"""Unified entry point.
-
-- If executed with --network and --dbfile -> CLI scan and save, then exit.
-- Otherwise -> start GUI.
-
-CLI requirements:
-- Use subprocess ping (through ScannerEngine)
-- Progress messages should be clear from the very start
-- Final output printed with tabulate
-- Ctrl+C stops everything and DOES NOT save
-"""
-
 from __future__ import annotations
 
-import argparse
 import sys
-import datetime as _dt
-
-from tabulate import tabulate
+import argparse
+from datetime import datetime
 
 from lib.netcalc import parse_network
-from lib.scanner import ScannerEngine
+from lib.scanner import LanScanner, ScanConfig
 from lib import db as dbmod
 
-
-def _now_str() -> str:
-    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def run_cli(args: argparse.Namespace) -> int:
-    info = parse_network(args.network)
+    ni = parse_network(args.network)
 
-    title = (args.title or "").strip()
-    if not title:
-        title = f"Scan {info.network_cidr}"
-
-    started_at = _now_str()
-
-    print(f"[+] Starting scan\n    title: {title}\n    network: {info.network_cidr}\n    hosts: {len(info.hosts)}\n    concurrent: {args.num_process}\n    ping_retries: {args.num_run}\n")
-    print(f"[+] Options: fqdn={args.fqdn} arp={args.arp} vendor={args.vendor}\n")
-
-    engine = ScannerEngine(
+    cfg = ScanConfig(
+        title=args.title or "",
+        network=ni.network,
+        ip_start=ni.ip_start,
+        ip_stop=ni.ip_stop,
+        broadcast=ni.broadcast,
         num_process=args.num_process,
         num_run=args.num_run,
-        flag_fqdn=args.fqdn,
-        flag_arp=args.arp,
-        flag_vendor=args.vendor,
+        flag_fqdn=not args.no_fqdn,
+        flag_arp=not args.no_arp,
+        flag_vendor=not args.no_vendor,
     )
 
-    # Progress: prefer tqdm, fallback to simple prints.
+    started_at = datetime.now().isoformat(timespec="seconds")
+    total = len(ni.hosts)
+
+    print(f"[INFO] Starting scan on network: {ni.network}")
+    print(f"[INFO] Host count: {total}")
+    print(f"[INFO] Concurrency: {cfg.num_process} | Retries: {cfg.num_run}")
+    print("[INFO] Pipeline: ping -> (fqdn) -> (arp) -> (vendor) per alive host")
+
+    results = []
+
+    # Better progress: always show from the beginning.
     try:
         from tqdm import tqdm  # type: ignore
-        bar = tqdm(total=len(info.hosts), desc="Scanning", unit="host")
-        def on_progress(done: int, total: int):
-            bar.n = done
-            bar.total = total
+        bar = tqdm(total=total, desc="Scanning", unit="host")
+        def on_progress(d, t):
+            bar.n = d
             bar.refresh()
     except Exception:
         bar = None
-        def on_progress(done: int, total: int):
-            # Print immediately from 0->1 so user sees it's running
-            if done == 1 or done == total or done % 10 == 0:
-                print(f"[=] Progress: {done}/{total}", flush=True)
+        def on_progress(d, t):
+            print(f"[PROGRESS] {d}/{t}")
 
-    def on_state(s: str):
-        # We emit at least one clear message early
-        print(f"[+] State: {s}", flush=True)
-
-    results = []
-    try:
-        # Emit an explicit initial progress line
-        on_state("ping + per-host details")
-        on_progress(0, len(info.hosts))
-        results = engine.scan_many(info.hosts, on_progress=on_progress, on_state=on_state)
-        if bar is not None:
-            bar.close()
-    except KeyboardInterrupt:
-        print("\n[!] Ctrl+C received: stopping scan (no save).", flush=True)
-        engine.stop()
-        return 2
-
-    ended_at = _now_str()
-
-    # Print table with tabulate
-    table = []
-    for r in results:
-        table.append([r.ip, "yes" if r.alive else "no", r.fqdn, r.mac, r.vendor])
-
-    print("\n[+] Scan completed")
-    print(f"    started: {started_at}")
-    print(f"    ended:   {ended_at}\n")
-
-    print(tabulate(table, headers=["ip", "alive", "fqdn", "arp_mac", "vendor"], tablefmt="github"))
-
-    # Save
-    conn = dbmod.connect(args.dbfile)
-    dbmod.init_db(conn)
-    scan_rows = [dbmod.ScanRow(ip=r.ip, alive=int(bool(r.alive)), fqdn=r.fqdn or "", mac=r.mac or "", vendor=r.vendor or "") for r in results]
-    dbmod.insert_scan(
-        conn,
-        title=title,
-        network_cidr=info.network_cidr,
-        ip_start=info.ip_start,
-        ip_stop=info.ip_stop,
-        broadcast=info.broadcast,
-        started_at=started_at,
-        ended_at=ended_at,
-        num_process=args.num_process,
-        num_run=args.num_run,
-        flag_fqdn=args.fqdn,
-        flag_arp=args.arp,
-        flag_vendor=args.vendor,
-        rows=scan_rows,
+    scanner = LanScanner(
+        ips=ni.hosts,
+        config=cfg,
+        on_host=lambda r: results.append(r),
+        on_progress=on_progress,
+        on_state=lambda s: print(f"[STATE] {s}"),
     )
-    conn.close()
-    print(f"\n[+] Saved to DB: {args.dbfile}")
+
+    try:
+        scanner.run()
+    except KeyboardInterrupt:
+        print("\n[WARN] CTRL+C received: stopping now. (Nothing will be saved)")
+        scanner.stop()
+        return 2
+    finally:
+        if bar is not None:
+            try:
+                bar.close()
+            except Exception:
+                pass
+
+    ended_at = datetime.now().isoformat(timespec="seconds")
+
+    header = {
+        "title": cfg.title,
+        "network": cfg.network,
+        "ip_start": cfg.ip_start,
+        "ip_stop": cfg.ip_stop,
+        "broadcast": cfg.broadcast,
+        "num_process": cfg.num_process,
+        "num_run": cfg.num_run,
+        "flag_fqdn": cfg.flag_fqdn,
+        "flag_arp": cfg.flag_arp,
+        "flag_vendor": cfg.flag_vendor,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "stopped": False,
+    }
+    rows = [{"ip": r.ip, "alive": r.alive, "fqdn": r.fqdn, "mac": r.mac, "vendor": r.vendor} for r in results]
+    scan_id = dbmod.insert_scan(args.dbfile, header, rows)
+    print(f"[INFO] Saved to DB: {args.dbfile} (scan_id={scan_id})")
+
+    from tabulate import tabulate  # type: ignore
+    import ipaddress
+
+    table = []
+    for r in sorted(results, key=lambda x: int(ipaddress.IPv4Address(x.ip))):
+        # If user requested only alive hosts, skip dead entries
+        if args.only_alive and not r.alive:
+            continue
+
+        table.append([r.ip, "YES" if r.alive else "NO", r.fqdn, r.mac, r.vendor])
+
+    print(tabulate(table, headers=["IP", "Alive", "FQDN", "MAC", "Vendor"], tablefmt="grid"))
     return 0
 
-
-def run_gui() -> int:
-    from main_gui import main
-    return main()
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="LAN scanner (CLI or GUI)")
-    p.add_argument("--network", help="IPv4 network in CIDR (e.g. 192.168.1.0/24)")
-    p.add_argument("--dbfile", help="SQLite DB file to save results (CLI mode)")
+def main() -> int:
+    p = argparse.ArgumentParser(description="LAN Scanner (GUI or CLI)")
+    p.add_argument("--network", help="IPv4 CIDR (e.g. 192.168.1.0/24) or single IPv4 (treated as /32)")
+    p.add_argument("--dbfile", help="SQLite DB file (required in CLI mode)")
     p.add_argument("--title", default="", help="Scan title")
     p.add_argument("--num-process", type=int, default=5, help="Concurrent ping processes")
     p.add_argument("--num-run", type=int, default=2, help="Ping retries per host")
-    p.add_argument("--fqdn", action=argparse.BooleanOptionalAction, default=True, help="Resolve FQDN")
-    p.add_argument("--arp", action=argparse.BooleanOptionalAction, default=True, help="Read ARP MAC")
-    p.add_argument("--vendor", action=argparse.BooleanOptionalAction, default=True, help="Vendor lookup")
-    return p
+    p.add_argument("--no-fqdn", action="store_true", help="Disable FQDN lookup")
+    p.add_argument("--no-arp", action="store_true", help="Disable ARP lookup")
+    p.add_argument("--no-vendor", action="store_true", help="Disable vendor lookup")
+    p.add_argument("--only-alive", action="store_true", help="Print only alive hosts")
+    args = p.parse_args()
 
-
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.network and args.dbfile:
+    if args.network and not args.dbfile:
+        print ("\nPlease pass also dbfile!\n")
+        p.print_help()
+        return 2
+    elif args.network and args.dbfile:
         return run_cli(args)
 
-    # No CLI args: start GUI
-    return run_gui()
-
+    from main_gui import main as gui_main
+    return gui_main()
 
 if __name__ == "__main__":
     raise SystemExit(main())
