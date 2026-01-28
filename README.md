@@ -5,6 +5,7 @@ It is fully cross-platform and works on:
 
 - ✅ **GUI with PySide6**
 - ✅ **Automatic CLI mode**
+- ✅ **Cli scan reader**
 - ✅ Windows / Linux
 - ✅ UI language: Italian if OS locale is Italian, otherwise English.
 
@@ -43,6 +44,18 @@ Automatic scan, output printed with tabulate, and results saved into a database:
 
 ```bash
 python main.py --network 192.168.1.0/24 --dbfile scans.sqlite --title "Office scan"
+```
+
+---
+
+## Scan reader (CLI)
+
+Scan reader that print with tabulate the results saved into a database:
+
+```bash
+python main_read_scans.py
+# or
+python main_read_scans.py -h
 ```
 
 ---
