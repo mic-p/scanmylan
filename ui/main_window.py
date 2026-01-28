@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from datetime import datetime
 from typing import Optional
+import csv
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QAction
@@ -110,6 +111,8 @@ class MainWindow(QMainWindow):
         # Save/Load
         self.save_btn = QPushButton(tr("save", self.lang))
         self.load_btn = QPushButton(tr("load", self.lang))
+        self.export_csv_btn = QPushButton(tr("export_csv", self.lang))
+        self.export_csv_btn.clicked.connect(self.on_export_csv)
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self.on_save)
         self.load_btn.clicked.connect(self.on_load)
@@ -206,6 +209,7 @@ class MainWindow(QMainWindow):
         rh = QHBoxLayout()
         rh.addWidget(self.save_btn)
         rh.addWidget(self.load_btn)
+        rh.addWidget(self.export_csv_btn)
         rh.addStretch(1)
         v.addLayout(rh)
 
@@ -473,3 +477,41 @@ class MainWindow(QMainWindow):
         self._scan_done = True
         self._stopped = header.stopped
         self.save_btn.setEnabled(not self._stopped)
+
+
+    # -----------------------------
+    # Export CSV (current visible view)
+    # -----------------------------
+    def on_export_csv(self) -> None:
+        # Export ONLY what is currently visible (proxy model):
+        # - respects "show only alive"
+        # - respects search filter
+        # - respects current sort order
+        if self.proxy.rowCount() <= 0:
+            QMessageBox.information(self, "Info", tr("msg_no_rows", self.lang))
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            tr("export_csv", self.lang),
+            "",
+            "CSV (*.csv);;All files (*.*)",
+       )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["ip_address", "fqdn", "arp", "vendor"])
+                for prow in range(self.proxy.rowCount()):
+                    ip = str(self.proxy.index(prow, 0).data() or "")
+                    fqdn = str(self.proxy.index(prow, 1).data() or "")
+                    mac = str(self.proxy.index(prow, 2).data() or "")
+                    vendor = str(self.proxy.index(prow, 3).data() or "")
+                    w.writerow([ip, fqdn, mac, vendor])
+            QMessageBox.information(self, "OK", tr("msg_export_ok", self.lang))
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"CSV export failed: {e}")

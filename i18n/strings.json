@@ -27,7 +27,10 @@
     "msg_scan_not_finished": "You can save only after the scan is finished.",
     "msg_no_db_selected": "No database file selected.",
     "msg_load_choose_scan": "Choose a scan to load",
-    "context_rescan": "Re-scan"
+    "context_rescan": "Re-scan",
+    "export_csv": "Export CSV",
+    "msg_no_rows": "No rows to export.",
+    "msg_export_ok": "CSV exported successfully."
   },
   "it": {
     "app_title": "Scanner LAN",
