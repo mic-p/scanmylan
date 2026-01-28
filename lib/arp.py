@@ -1,52 +1,93 @@
+"""ARP table reader.
+
+Requirements:
+- Windows: parse `arp -a`
+- Linux: parse `/proc/net/arp`
+- Other OS: do nothing (return empty results)
+
+We normalize MAC to uppercase with ':' separators: AA:BB:CC:DD:EE:FF
+"""
+
 from __future__ import annotations
+
 import re
 import subprocess
-from typing import Dict
-from .platform_utils import platform_key
+from pathlib import Path
+from typing import Dict, Optional
 
-_MAC_RE = re.compile(r"([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}")
-_IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+from .platform_utils import get_os
+
+
+_MAC_RE = re.compile(r"([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})")
+
 
 def _normalize_mac(mac: str) -> str:
-    return mac.strip().replace("-", ":").upper()
+    mac = mac.strip().replace("-", ":").upper()
+    return mac
+
 
 def read_arp_table() -> Dict[str, str]:
-    pk = platform_key()
-    if pk == "windows":
-        return _read_arp_windows()
-    if pk == "linux":
-        return _read_arp_linux()
-    # placeholder for other OS
+    os_name = get_os()
+    if os_name == "windows":
+        return _read_windows_arp()
+    if os_name == "linux":
+        return _read_linux_proc_arp()
     return {}
 
-def _read_arp_windows() -> Dict[str, str]:
-    try:
-        p = subprocess.run(["arp", "-a"], capture_output=True, text=True)
-        text = (p.stdout or "") + "\n" + (p.stderr or "")
-    except Exception:
-        return {}
-    out: Dict[str, str] = {}
-    for line in text.splitlines():
-        ipm = _IP_RE.search(line)
-        macm = _MAC_RE.search(line)
-        if not ipm or not macm:
-            continue
-        out[ipm.group(1)] = _normalize_mac(macm.group(0))
-    return out
 
-def _read_arp_linux() -> Dict[str, str]:
+def get_mac_for_ip(ip: str) -> str:
+    # Simple implementation: read the full ARP table and return matching IP.
+    # This is called after a successful ping, which should populate ARP/neighbor cache.
+    table = read_arp_table()
+    return table.get(ip, "")
+
+
+def _read_windows_arp() -> Dict[str, str]:
     try:
-        with open("/proc/net/arp", "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.read().splitlines()
+        p = subprocess.run(["arp", "-a"], capture_output=True, text=True, check=False)
+        out = p.stdout or ""
     except Exception:
         return {}
-    out: Dict[str, str] = {}
-    for line in lines[1:]:
-        parts = line.split()
-        if len(parts) < 4:
+
+    result: Dict[str, str] = {}
+    # Lines look like: 192.168.88.11         0c-c4-7a-43-12-d8     dynamic
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
             continue
-        ip = parts[0].strip()
-        mac = parts[3].strip()
-        if mac and mac != "00:00:00:00:00:00":
-            out[ip] = _normalize_mac(mac)
-    return out
+        parts = re.split(r"\s+", line)
+        if len(parts) >= 2 and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
+            ip = parts[0]
+            mac = parts[1]
+            if _MAC_RE.search(mac):
+                result[ip] = _normalize_mac(mac)
+    return result
+
+
+def _read_linux_proc_arp() -> Dict[str, str]:
+    path = Path("/proc/net/arp")
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return {}
+
+    result: Dict[str, str] = {}
+    lines = text.splitlines()
+    if not lines:
+        return result
+
+    # Skip header line
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"\s+", line)
+        # IP address HW type Flags HW address Mask Device
+        if len(parts) >= 4 and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
+            ip = parts[0]
+            mac = parts[3]
+            if _MAC_RE.search(mac):
+                result[ip] = _normalize_mac(mac)
+    return result

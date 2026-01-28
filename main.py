@@ -1,148 +1,150 @@
+"""Unified entry point.
+
+- If executed with --network and --dbfile -> CLI scan and save, then exit.
+- Otherwise -> start GUI.
+
+CLI requirements:
+- Use subprocess ping (through ScannerEngine)
+- Progress messages should be clear from the very start
+- Final output printed with tabulate
+- Ctrl+C stops everything and DOES NOT save
+"""
+
 from __future__ import annotations
 
 import argparse
-import signal
 import sys
-from datetime import datetime
-from typing import Any, Dict, List
+import datetime as _dt
 
-from lib.scanner import LanScanner
-from lib import db as db_lib
+from tabulate import tabulate
+
+from lib.netcalc import parse_network
+from lib.scanner import ScannerEngine
+from lib import db as dbmod
 
 
-def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _now_str() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def run_cli(args: argparse.Namespace) -> int:
-    started_at = now_text()
-    interrupted = False
-    results: List[Dict[str, Any]] = []
+    info = parse_network(args.network)
 
-    use_tqdm = False
-    pbar = None
+    title = (args.title or "").strip()
+    if not title:
+        title = f"Scan {info.network_cidr}"
+
+    started_at = _now_str()
+
+    print(f"[+] Starting scan\n    title: {title}\n    network: {info.network_cidr}\n    hosts: {len(info.hosts)}\n    concurrent: {args.num_process}\n    ping_retries: {args.num_run}\n")
+    print(f"[+] Options: fqdn={args.fqdn} arp={args.arp} vendor={args.vendor}\n")
+
+    engine = ScannerEngine(
+        num_process=args.num_process,
+        num_run=args.num_run,
+        flag_fqdn=args.fqdn,
+        flag_arp=args.arp,
+        flag_vendor=args.vendor,
+    )
+
+    # Progress: prefer tqdm, fallback to simple prints.
     try:
         from tqdm import tqdm  # type: ignore
-        use_tqdm = True
+        bar = tqdm(total=len(info.hosts), desc="Scanning", unit="host")
+        def on_progress(done: int, total: int):
+            bar.n = done
+            bar.total = total
+            bar.refresh()
     except Exception:
-        use_tqdm = False
-
-    def on_progress(done: int, total: int):
-        nonlocal pbar
-        if use_tqdm:
-            if pbar is None:
-                from tqdm import tqdm  # type: ignore
-                pbar = tqdm(total=total, unit="host")
-            pbar.total = total
-            pbar.n = done
-            pbar.refresh()
-        else:
-            if total > 0 and (done == total or done % 10 == 0):
-                print(f"progress: {done}/{total}")
+        bar = None
+        def on_progress(done: int, total: int):
+            # Print immediately from 0->1 so user sees it's running
+            if done == 1 or done == total or done % 10 == 0:
+                print(f"[=] Progress: {done}/{total}", flush=True)
 
     def on_state(s: str):
-        if s:
-            print(f"state: {s}")
+        # We emit at least one clear message early
+        print(f"[+] State: {s}", flush=True)
 
-    scanner = LanScanner(
-        network=args.network,
-        num_process=args.num_process,
-        num_run=args.num_run,
-        flag_fqdn=not args.no_fqdn,
-        flag_arp=not args.no_arp,
-        flag_vendor=not args.no_vendor,
-        on_progress=on_progress,
-        on_state=on_state,
-    )
-
-    def handle_sigint(sig, frame):
-        nonlocal interrupted
-        interrupted = True
-        scanner.stop()
-
-    signal.signal(signal.SIGINT, handle_sigint)
-
+    results = []
     try:
-        results = scanner.run()
-    finally:
-        if pbar is not None:
-            pbar.close()
+        # Emit an explicit initial progress line
+        on_state("ping + per-host details")
+        on_progress(0, len(info.hosts))
+        results = engine.scan_many(info.hosts, on_progress=on_progress, on_state=on_state)
+        if bar is not None:
+            bar.close()
+    except KeyboardInterrupt:
+        print("\n[!] Ctrl+C received: stopping scan (no save).", flush=True)
+        engine.stop()
+        return 2
 
-    if interrupted:
-        print("\nInterrotto (CTRL+C): stop completo, NON salvo nulla.")
-        return 130
+    ended_at = _now_str()
 
-    finished_at = now_text()
+    # Print table with tabulate
+    table = []
+    for r in results:
+        table.append([r.ip, "yes" if r.alive else "no", r.fqdn, r.mac, r.vendor])
 
-    info = LanScanner.compute_network_info(args.network)
-    con = db_lib.connect(args.dbfile)
-    db_lib.insert_scan(
-        con,
-        title=args.title or "(senza titolo)",
-        summary=args.summary or "",
-        network=info.get("network", ""),
-        ip_start=info.get("ip_start", ""),
-        ip_stop=info.get("ip_stop", ""),
-        broadcast=info.get("broadcast", ""),
+    print("\n[+] Scan completed")
+    print(f"    started: {started_at}")
+    print(f"    ended:   {ended_at}\n")
+
+    print(tabulate(table, headers=["ip", "alive", "fqdn", "arp_mac", "vendor"], tablefmt="github"))
+
+    # Save
+    conn = dbmod.connect(args.dbfile)
+    dbmod.init_db(conn)
+    scan_rows = [dbmod.ScanRow(ip=r.ip, alive=int(bool(r.alive)), fqdn=r.fqdn or "", mac=r.mac or "", vendor=r.vendor or "") for r in results]
+    dbmod.insert_scan(
+        conn,
+        title=title,
+        network_cidr=info.network_cidr,
+        ip_start=info.ip_start,
+        ip_stop=info.ip_stop,
+        broadcast=info.broadcast,
         started_at=started_at,
-        finished_at=finished_at,
+        ended_at=ended_at,
         num_process=args.num_process,
         num_run=args.num_run,
-        flag_fqdn=not args.no_fqdn,
-        flag_arp=not args.no_arp,
-        flag_vendor=not args.no_vendor,
-        results=results,
+        flag_fqdn=args.fqdn,
+        flag_arp=args.arp,
+        flag_vendor=args.vendor,
+        rows=scan_rows,
     )
-    con.close()
-
-    try:
-        from tabulate import tabulate  # type: ignore
-        table = []
-        for r in results:
-            table.append([
-                r.get("ip_address", ""),
-                r.get("fqdn", ""),
-                r.get("mac", ""),
-                r.get("vendor", ""),
-                "yes" if r.get("alive") else "no",
-            ])
-        print("\n" + tabulate(table, headers=["ip_address", "fqdn", "arp", "vendor", "alive"], tablefmt="github"))
-    except Exception:
-        for r in results:
-            print(r)
-
-    print(f"\nSalvato su: {args.dbfile}")
+    conn.close()
+    print(f"\n[+] Saved to DB: {args.dbfile}")
     return 0
 
 
-def main():
-    if len(sys.argv) == 1:
-        from main_gui import main as gui_main
-        gui_main()
-        return
+def run_gui() -> int:
+    from main_gui import main
+    return main()
 
-    parser = argparse.ArgumentParser(description="LAN Scanner (CLI/GUI)")
-    parser.add_argument("--network", help="IPv4 CIDR network, es: 192.168.88.0/24")
-    parser.add_argument("--dbfile", help="Path file SQLite per salvare (CLI)")
-    parser.add_argument("--title", default="", help="Titolo scansione")
-    parser.add_argument("--summary", default="", help="Riassunto scansione")
 
-    parser.add_argument("--num-process", type=int, default=5, dest="num_process", help="Ping concorrenti")
-    parser.add_argument("--num-run", type=int, default=2, dest="num_run", help="Retry per IP")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="LAN scanner (CLI or GUI)")
+    p.add_argument("--network", help="IPv4 network in CIDR (e.g. 192.168.1.0/24)")
+    p.add_argument("--dbfile", help="SQLite DB file to save results (CLI mode)")
+    p.add_argument("--title", default="", help="Scan title")
+    p.add_argument("--num-process", type=int, default=5, help="Concurrent ping processes")
+    p.add_argument("--num-run", type=int, default=2, help="Ping retries per host")
+    p.add_argument("--fqdn", action=argparse.BooleanOptionalAction, default=True, help="Resolve FQDN")
+    p.add_argument("--arp", action=argparse.BooleanOptionalAction, default=True, help="Read ARP MAC")
+    p.add_argument("--vendor", action=argparse.BooleanOptionalAction, default=True, help="Vendor lookup")
+    return p
 
-    parser.add_argument("--no-fqdn", action="store_true", help="Disabilita fqdn")
-    parser.add_argument("--no-arp", action="store_true", help="Disabilita arp")
-    parser.add_argument("--no-vendor", action="store_true", help="Disabilita vendor")
 
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
-    if not args.network or not args.dbfile:
-        from main_gui import main as gui_main
-        gui_main()
-        return
+    if args.network and args.dbfile:
+        return run_cli(args)
 
-    sys.exit(run_cli(args))
+    # No CLI args: start GUI
+    return run_gui()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

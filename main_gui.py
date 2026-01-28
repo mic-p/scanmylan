@@ -1,14 +1,19 @@
+"""GUI entry point."""
+
 from __future__ import annotations
+
 import sys
 from PySide6.QtWidgets import QApplication
+
 from ui.main_window import MainWindow
 
-def main():
+
+def main() -> int:
     app = QApplication(sys.argv)
     w = MainWindow()
-    w.resize(1100, 650)
     w.show()
-    sys.exit(app.exec())
+    return app.exec()
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

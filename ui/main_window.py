@@ -1,388 +1,482 @@
+"""Main GUI window (PySide6).
+
+The GUI follows the user's specification:
+- Network CIDR input + Calculate (ipaddress validation)
+- Start/Stop scan with multithreaded subprocess pings
+- Options: fqdn / arp / vendor / show only alive
+- Search across all table columns
+- Save/Load to SQLite (1-N)
+- Right-click a row -> Re-scan (single IP)
+"""
+
 from __future__ import annotations
 
+import datetime as _dt
 import threading
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import List, Optional
 
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
-    QVBoxLayout, QHBoxLayout, QMessageBox, QTableWidget,
-    QTableWidgetItem, QSpinBox, QCheckBox, QFileDialog, QDialog, QListWidget,
-    QListWidgetItem, QDialogButtonBox
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QMessageBox, QSpinBox, QCheckBox, QFileDialog, QTableView, QHeaderView,
+    QMenu, QInputDialog
 )
 
-from lib.scanner import LanScanner
-from lib import db as db_lib
+from lib.i18n import I18N
+from lib.netcalc import parse_network, NetInfo
+from lib.scanner import ScannerEngine, HostResult
+from lib import db as dbmod
+
+from .models import HostTableModel, HostProxyModel, COL_IP
 
 
-def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+class ScanWorker(QObject):
+    host = Signal(object)          # HostResult
+    progress = Signal(int, int)    # done, total
+    state = Signal(str)            # state text
+    finished = Signal()
+    stopped = Signal()
 
+    def __init__(self, engine: ScannerEngine, ips: List[str]):
+        super().__init__()
+        self.engine = engine
+        self.ips = ips
 
-class ScanSignals(QObject):
-    host = Signal(dict)
-    progress = Signal(int, int)
-    state = Signal(str)
-    finished = Signal(list)
+    def run(self) -> None:
+        def on_host(res: HostResult):
+            self.host.emit(res)
 
+        def on_progress(done: int, total: int):
+            self.progress.emit(done, total)
 
-class ScanWorker:
-    def __init__(self, scanner: LanScanner, signals: ScanSignals):
-        self.scanner = scanner
-        self.signals = signals
+        def on_state(s: str):
+            self.state.emit(s)
 
-    def run(self):
-        try:
-            res = self.scanner.run()
-            self.signals.finished.emit(res)
-        except Exception as e:
-            self.signals.state.emit(f"error: {e}")
-            self.signals.finished.emit([])
+        self.engine.scan_many(self.ips, on_host=on_host, on_progress=on_progress, on_state=on_state)
 
-
-class ScanPickerDialog(QDialog):
-    def __init__(self, scans: List[tuple], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Seleziona scansione")
-        self.selected_scan_id: Optional[int] = None
-
-        layout = QVBoxLayout(self)
-        self.listw = QListWidget()
-        for sid, title, started_at in scans:
-            item = QListWidgetItem(f"{title}  |  {started_at}")
-            item.setData(Qt.UserRole, sid)
-            self.listw.addItem(item)
-        layout.addWidget(self.listw)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _accept(self):
-        item = self.listw.currentItem()
-        if not item:
-            return
-        self.selected_scan_id = int(item.data(Qt.UserRole))
-        self.accept()
+        if self.engine.is_stopped():
+            self.stopped.emit()
+        else:
+            self.finished.emit()
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LAN Scanner")
+        self.base_dir = Path(__file__).resolve().parents[1]
+        self.i18n = I18N(self.base_dir)
 
-        self._scanner: Optional[LanScanner] = None
-        self._scan_thread: Optional[threading.Thread] = None
-        self._signals = ScanSignals()
-        self._signals.host.connect(self._on_host)
-        self._signals.progress.connect(self._on_progress)
-        self._signals.state.connect(self._on_state)
-        self._signals.finished.connect(self._on_finished)
+        self.setWindowTitle(self.i18n.tr("app_title"))
+        self.resize(1100, 650)
 
-        self._results_by_ip: Dict[str, Dict[str, Any]] = {}
-        self._final_results: List[Dict[str, Any]] = []
+        self.net_info: Optional[NetInfo] = None
+        self.engine: Optional[ScannerEngine] = None
+        self.worker: Optional[ScanWorker] = None
+        self.worker_thread: Optional[threading.Thread] = None
 
-        # Row a: titolo + summary
-        self.title_label = QLabel("titolo")
-        self.title_edit = QLineEdit()
-        self.summary_edit = QLineEdit()
-        self.summary_edit.setPlaceholderText("riassunto del lavoro")
+        self.scan_running = False
+        self.scan_started_at = ""
+        self.scan_ended_at = ""
 
-        # Row b: ethernet + network + calcola
-        self.net_label = QLabel("ethernet")
-        self.net_edit = QLineEdit()
-        self.net_edit.setPlaceholderText("solo CIDR IPv4: es 192.168.88.0/24 (o IP singolo)")
-        self.calc_btn = QPushButton("calcola")
+        self._build_ui()
+        self._connect_signals()
 
-        # Row c: network calc text
-        self.net_info = QLineEdit()
-        self.net_info.setReadOnly(True)
+        # Default: sorting enabled with numeric IP sort
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(0, Qt.AscendingOrder)
 
-        # Row d/e: start/stop + time
-        self.start_btn = QPushButton("start")
-        self.stop_btn = QPushButton("stop")
-        self.stop_btn.setEnabled(False)
-
-        self.start_time = QLineEdit(); self.start_time.setReadOnly(True)
-        self.end_time = QLineEdit(); self.end_time.setReadOnly(True)
-
-        # Row f: num_process / num_run
-        self.num_process = QSpinBox()
-        self.num_process.setRange(1, 512)
-        self.num_process.setValue(5)
-        self.num_run = QSpinBox()
-        self.num_run.setRange(1, 20)
-        self.num_run.setValue(2)
-
-        # Row g: flags
-        self.flag_fqdn = QCheckBox("fqdn"); self.flag_fqdn.setChecked(True)
-        self.flag_arp = QCheckBox("arp"); self.flag_arp.setChecked(True)
-        self.flag_vendor = QCheckBox("vendor"); self.flag_vendor.setChecked(True)
-
-        # Row h: save/load
-        self.save_btn = QPushButton("salva")
-        self.load_btn = QPushButton("carica")
-        self.save_btn.setEnabled(False)
-
-        self.progress_text = QLineEdit()
-        self.progress_text.setReadOnly(True)
-
-        # Table
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["ip_address", "fqdn", "arp", "vendor"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-
+    def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(self.title_label)
-        row1.addWidget(self.title_edit, 2)
-        row1.addWidget(self.summary_edit, 4)
-        main.addLayout(row1)
+        # Row A: Title
+        row_a = QHBoxLayout()
+        row_a.addWidget(QLabel(self.i18n.tr("title")))
+        self.title_edit = QLineEdit()
+        row_a.addWidget(self.title_edit, 1)
+        main.addLayout(row_a)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(self.net_label)
-        row2.addWidget(self.net_edit, 3)
-        row2.addWidget(self.calc_btn)
-        main.addLayout(row2)
+        # Row B: Network + Calculate
+        row_b = QHBoxLayout()
+        row_b.addWidget(QLabel(self.i18n.tr("ethernet")))
+        row_b.addWidget(QLabel(self.i18n.tr("network")))
+        self.net_edit = QLineEdit()
+        self.net_edit.setPlaceholderText("192.168.1.0/24")
+        row_b.addWidget(self.net_edit, 1)
+        self.calc_btn = QPushButton(self.i18n.tr("calculate"))
+        row_b.addWidget(self.calc_btn)
+        main.addLayout(row_b)
 
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("ip_start | ip_stop | broadcast"))
-        row3.addWidget(self.net_info, 1)
-        main.addLayout(row3)
+        # Row C: Net info
+        row_c = QHBoxLayout()
+        self.net_info_edit = QLineEdit()
+        self.net_info_edit.setReadOnly(True)
+        row_c.addWidget(self.net_info_edit, 1)
+        main.addLayout(row_c)
 
-        row4 = QHBoxLayout()
-        row4.addWidget(self.start_btn)
-        row4.addWidget(self.stop_btn)
-        row4.addWidget(QLabel("ora_inizio"))
-        row4.addWidget(self.start_time)
-        row4.addWidget(QLabel("ora_fine"))
-        row4.addWidget(self.end_time)
-        main.addLayout(row4)
+        # Row D/E/F: Start/Stop + times + params
+        row_def = QHBoxLayout()
+        self.start_btn = QPushButton(self.i18n.tr("start"))
+        self.stop_btn = QPushButton(self.i18n.tr("stop"))
+        self.stop_btn.setEnabled(False)
+        row_def.addWidget(self.start_btn)
+        row_def.addWidget(self.stop_btn)
 
-        row5 = QHBoxLayout()
-        row5.addWidget(QLabel("num_process"))
-        row5.addWidget(self.num_process)
-        row5.addWidget(QLabel("num_run"))
-        row5.addWidget(self.num_run)
-        row5.addStretch(1)
-        row5.addWidget(QLabel("progress"))
-        row5.addWidget(self.progress_text)
-        main.addLayout(row5)
+        row_def.addWidget(QLabel(self.i18n.tr("start_time")))
+        self.start_time = QLineEdit()
+        self.start_time.setReadOnly(True)
+        self.start_time.setFixedWidth(160)
+        row_def.addWidget(self.start_time)
 
-        row6 = QHBoxLayout()
-        row6.addWidget(self.flag_fqdn)
-        row6.addWidget(self.flag_arp)
-        row6.addWidget(self.flag_vendor)
-        row6.addStretch(1)
-        main.addLayout(row6)
+        row_def.addWidget(QLabel(self.i18n.tr("end_time")))
+        self.end_time = QLineEdit()
+        self.end_time.setReadOnly(True)
+        self.end_time.setFixedWidth(160)
+        row_def.addWidget(self.end_time)
 
-        row7 = QHBoxLayout()
-        row7.addWidget(self.save_btn)
-        row7.addWidget(self.load_btn)
-        row7.addStretch(1)
-        main.addLayout(row7)
+        row_def.addWidget(QLabel(self.i18n.tr("num_process")))
+        self.num_process = QSpinBox()
+        self.num_process.setRange(1, 512)
+        self.num_process.setValue(5)
+        self.num_process.setFixedWidth(80)
+        row_def.addWidget(self.num_process)
+
+        row_def.addWidget(QLabel(self.i18n.tr("num_run")))
+        self.num_run = QSpinBox()
+        self.num_run.setRange(1, 20)
+        self.num_run.setValue(2)
+        self.num_run.setFixedWidth(80)
+        row_def.addWidget(self.num_run)
+
+        main.addLayout(row_def)
+
+        # Row G: Options (checkboxes)
+        row_g = QHBoxLayout()
+        row_g.addWidget(QLabel(self.i18n.tr("options")))
+        self.fqdn_cb = QCheckBox(self.i18n.tr("opt_fqdn"))
+        self.arp_cb = QCheckBox(self.i18n.tr("opt_arp"))
+        self.vendor_cb = QCheckBox(self.i18n.tr("opt_vendor"))
+        self.only_alive_cb = QCheckBox(self.i18n.tr("opt_only_alive"))
+
+        self.fqdn_cb.setChecked(True)
+        self.arp_cb.setChecked(True)
+        self.vendor_cb.setChecked(True)
+        self.only_alive_cb.setChecked(False)
+
+        row_g.addWidget(self.fqdn_cb)
+        row_g.addWidget(self.arp_cb)
+        row_g.addWidget(self.vendor_cb)
+        row_g.addWidget(self.only_alive_cb)
+        row_g.addStretch(1)
+        main.addLayout(row_g)
+
+        # Search row (between options and save/load row)
+        row_search = QHBoxLayout()
+        row_search.addWidget(QLabel(self.i18n.tr("search")))
+        self.search_edit = QLineEdit()
+        row_search.addWidget(self.search_edit, 1)
+        self.search_btn = QPushButton(self.i18n.tr("do_search"))
+        self.reset_btn = QPushButton(self.i18n.tr("reset"))
+        row_search.addWidget(self.search_btn)
+        row_search.addWidget(self.reset_btn)
+        main.addLayout(row_search)
+
+        # Row H: Save/Load
+        row_h = QHBoxLayout()
+        self.save_btn = QPushButton(self.i18n.tr("save"))
+        self.load_btn = QPushButton(self.i18n.tr("load"))
+        self.save_btn.setEnabled(False)
+        row_h.addWidget(self.save_btn)
+        row_h.addWidget(self.load_btn)
+        row_h.addStretch(1)
+        main.addLayout(row_h)
+
+        # Table
+        self.model = HostTableModel()
+        self.proxy = HostProxyModel()
+        self.proxy.setSourceModel(self.model)
+
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+
+        # Make columns evenly stretch to fill space
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
 
         main.addWidget(self.table, 1)
 
-        # Connect
-        self.calc_btn.clicked.connect(self._calc_network)
-        self.start_btn.clicked.connect(self._start_scan)
-        self.stop_btn.clicked.connect(self._stop_scan)
-        self.save_btn.clicked.connect(self._save_db)
-        self.load_btn.clicked.connect(self._load_db)
+        # Translate headers
+        self.model.set_headers([
+            self.i18n.tr("ip_address"),
+            self.i18n.tr("fqdn_col"),
+            self.i18n.tr("arp_col"),
+            self.i18n.tr("vendor_col"),
+        ])
 
-    def _err(self, title: str, text: str):
-        QMessageBox.critical(self, title, text)
+    def _connect_signals(self) -> None:
+        self.calc_btn.clicked.connect(self.on_calculate)
+        self.start_btn.clicked.connect(self.on_start)
+        self.stop_btn.clicked.connect(self.on_stop)
 
-    def _info(self, title: str, text: str):
-        QMessageBox.information(self, title, text)
+        self.save_btn.clicked.connect(self.on_save)
+        self.load_btn.clicked.connect(self.on_load)
 
-    def _calc_network(self) -> bool:
+        self.only_alive_cb.stateChanged.connect(self.on_only_alive_toggled)
+
+        self.search_btn.clicked.connect(self.on_search)
+        self.reset_btn.clicked.connect(self.on_reset_search)
+
+        self.table.customContextMenuRequested.connect(self.on_context_menu)
+
+    def _now_str(self) -> str:
+        # ISO-like but readable
+        return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def on_calculate(self) -> None:
         try:
-            info = LanScanner.compute_network_info(self.net_edit.text())
-            self.net_edit.setText(info["network"])
-            self.net_info.setText(f"{info['ip_start']}  |  {info['ip_stop']}  |  {info['broadcast']}")
-            return True
-        except Exception as e:
-            self.net_info.setText("")
-            self._err("Errore network", str(e))
-            return False
+            info = parse_network(self.net_edit.text())
+        except Exception:
+            QMessageBox.critical(self, self.i18n.tr("msg_invalid_network_title"), self.i18n.tr("msg_invalid_network_body"))
+            return
 
-    def _reset_run(self):
-        self.table.setRowCount(0)
-        self._results_by_ip.clear()
-        self._final_results = []
-        self.progress_text.setText("")
-        self.start_time.setText("")
+        self.net_info = info
+        self.net_edit.setText(info.network_cidr)
+        self.net_info_edit.setText(self.i18n.tr("net_info", start=info.ip_start, stop=info.ip_stop, broadcast=info.broadcast))
+
+    def on_start(self) -> None:
+        if self.scan_running:
+            QMessageBox.information(self, self.i18n.tr("app_title"), self.i18n.tr("msg_scan_running"))
+            return
+
+        # Validate network first
+        self.on_calculate()
+        if not self.net_info:
+            return
+
+        # Reset UI
+        self.model.clear()
+        self.proxy.set_search_text("")
+        self.search_edit.setText("")
         self.end_time.setText("")
         self.save_btn.setEnabled(False)
 
-    def _start_scan(self):
-        if not self._calc_network():
-            return
+        self.scan_started_at = self._now_str()
+        self.start_time.setText(self.scan_started_at)
 
-        self._reset_run()
-        self.start_time.setText(now_text())
-
+        self.scan_running = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.calc_btn.setEnabled(False)
-        self.save_btn.setEnabled(False)
 
-        self._scanner = LanScanner(
-            network=self.net_edit.text().strip(),
+        self.engine = ScannerEngine(
             num_process=self.num_process.value(),
             num_run=self.num_run.value(),
-            flag_fqdn=self.flag_fqdn.isChecked(),
-            flag_arp=self.flag_arp.isChecked(),
-            flag_vendor=self.flag_vendor.isChecked(),
-            on_host=lambda d: self._signals.host.emit(d),
-            on_progress=lambda d, t: self._signals.progress.emit(d, t),
-            on_state=lambda s: self._signals.state.emit(s),
+            flag_fqdn=self.fqdn_cb.isChecked(),
+            flag_arp=self.arp_cb.isChecked(),
+            flag_vendor=self.vendor_cb.isChecked(),
         )
 
-        worker = ScanWorker(self._scanner, self._signals)
-        self._scan_thread = threading.Thread(target=worker.run, daemon=True)
-        self._scan_thread.start()
+        self.worker = ScanWorker(self.engine, self.net_info.hosts)
+        self.worker.host.connect(self._on_host)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.state.connect(self._on_state)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.stopped.connect(self._on_stopped)
 
-    def _stop_scan(self):
-        if not self._scanner:
+        self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
+        self.worker_thread.start()
+
+    def on_stop(self) -> None:
+        if not self.scan_running or not self.engine:
             return
-        self.stop_btn.setEnabled(False)
-        try:
-            self._scanner.stop()
-        except Exception:
-            pass
+        self.engine.stop()
 
-    def _ensure_row(self, ip: str) -> int:
-        existing = self._results_by_ip.get(ip, {}).get("_row")
-        if existing is not None:
-            return int(existing)
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(ip))
-        self.table.setItem(row, 1, QTableWidgetItem(""))
-        self.table.setItem(row, 2, QTableWidgetItem(""))
-        self.table.setItem(row, 3, QTableWidgetItem(""))
-        self._results_by_ip.setdefault(ip, {})["_row"] = row
-        return row
-
-    def _on_host(self, d: Dict[str, Any]):
-        ip = str(d.get("ip_address") or "")
-        if not ip:
-            return
-        self._results_by_ip.setdefault(ip, {}).update(d)
-        row = self._ensure_row(ip)
-
-        fqdn = str(self._results_by_ip[ip].get("fqdn") or "")
-        mac = str(self._results_by_ip[ip].get("mac") or "")
-        vendor = str(self._results_by_ip[ip].get("vendor") or "")
-
-        self.table.item(row, 1).setText(fqdn)
-        self.table.item(row, 2).setText(mac)
-        self.table.item(row, 3).setText(vendor)
-
-        alive = bool(self._results_by_ip[ip].get("alive"))
-        if not alive:
-            for c in range(4):
-                it = self.table.item(row, c)
-                it.setForeground(Qt.gray)
-
-    def _on_progress(self, done: int, total: int):
-        self.progress_text.setText(f"{done}/{total}")
-
-    def _on_state(self, s: str):
-        if s:
-            self.setWindowTitle(f"LAN Scanner - {s}")
-
-    def _on_finished(self, results: List[Dict[str, Any]]):
-        self.end_time.setText(now_text())
-
+    def _finish_common(self, msg: str) -> None:
+        self.scan_running = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.calc_btn.setEnabled(True)
 
-        self._final_results = results or []
-        # save enabled only when scan thread ended (even if stopped)
+        self.scan_ended_at = self._now_str()
+        self.end_time.setText(self.scan_ended_at)
+
+        # Allow saving after completion (including Stop)
         self.save_btn.setEnabled(True)
 
-    def _save_db(self):
-        if not self._final_results:
-            self._err("Errore", "Nessun risultato da salvare.")
-            return
-        dbfile, _ = QFileDialog.getSaveFileName(self, "Salva su DB SQLite", "", "SQLite DB (*.sqlite *.db);;All files (*)")
-        if not dbfile:
-            return
-        try:
-            info = LanScanner.compute_network_info(self.net_edit.text())
-        except Exception:
-            info = {"network": self.net_edit.text().strip(), "ip_start": "", "ip_stop": "", "broadcast": ""}
+        QMessageBox.information(self, self.i18n.tr("app_title"), msg)
 
-        try:
-            con = db_lib.connect(dbfile)
-            db_lib.insert_scan(
-                con,
-                title=self.title_edit.text().strip() or "(senza titolo)",
-                summary=self.summary_edit.text().strip(),
-                network=info.get("network", ""),
-                ip_start=info.get("ip_start", ""),
-                ip_stop=info.get("ip_stop", ""),
-                broadcast=info.get("broadcast", ""),
-                started_at=self.start_time.text().strip() or now_text(),
-                finished_at=self.end_time.text().strip() or now_text(),
-                num_process=self.num_process.value(),
-                num_run=self.num_run.value(),
-                flag_fqdn=self.flag_fqdn.isChecked(),
-                flag_arp=self.flag_arp.isChecked(),
-                flag_vendor=self.flag_vendor.isChecked(),
-                results=self._final_results,
-            )
-            con.close()
-            self._info("Salvataggio", "Scansione salvata (aggiunta al DB).")
-        except Exception as e:
-            self._err("Errore DB", str(e))
+    def _on_host(self, res: HostResult) -> None:
+        self.model.upsert(res)
+        # Keep default sorting by IP
+        self.table.sortByColumn(0, Qt.AscendingOrder)
 
-    def _load_db(self):
-        dbfile, _ = QFileDialog.getOpenFileName(self, "Apri DB SQLite", "", "SQLite DB (*.sqlite *.db);;All files (*)")
-        if not dbfile:
-            return
-        try:
-            con = db_lib.connect(dbfile)
-            scans = db_lib.list_scans(con)
-            if not scans:
-                con.close()
-                self._info("Carica", "Nessuna scansione nel DB.")
-                return
-            dlg = ScanPickerDialog(scans, parent=self)
-            if dlg.exec() != QDialog.Accepted or dlg.selected_scan_id is None:
-                con.close()
-                return
-            header, rows = db_lib.load_scan(con, dlg.selected_scan_id)
-            con.close()
-        except Exception as e:
-            self._err("Errore DB", str(e))
+    def _on_progress(self, done: int, total: int) -> None:
+        # You can extend this to a progress bar if needed
+        # For now we update window title with progress info.
+        self.setWindowTitle(f"{self.i18n.tr('app_title')} - {done}/{total}")
+
+    def _on_state(self, s: str) -> None:
+        # Could be displayed somewhere; keeping minimal.
+        pass
+
+    def _on_finished(self) -> None:
+        self._finish_common(self.i18n.tr("msg_scan_done"))
+
+    def _on_stopped(self) -> None:
+        self._finish_common(self.i18n.tr("msg_scan_stopped"))
+
+    def on_only_alive_toggled(self) -> None:
+        self.proxy.set_only_alive(self.only_alive_cb.isChecked())
+
+    def on_search(self) -> None:
+        self.proxy.set_search_text(self.search_edit.text())
+
+    def on_reset_search(self) -> None:
+        self.search_edit.setText("")
+        self.proxy.set_search_text("")
+        # Keep alive filter as-is
+
+    def on_context_menu(self, pos) -> None:
+        # Right-click menu on a row: Re-scan
+        idx = self.table.indexAt(pos)
+        if not idx.isValid():
             return
 
-        self._reset_run()
+        menu = QMenu(self.table)
+        act = menu.addAction(self.i18n.tr("context_rescan"))
+
+        action = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if action != act:
+            return
+
+        # Re-scan should not interfere with an active full scan
+        if self.scan_running:
+            return
+
+        # Get the IP from the selected row (proxy -> source)
+        ip = self.proxy.data(self.proxy.index(idx.row(), COL_IP), Qt.DisplayRole) or ""
+        ip = str(ip)
+
+        if not ip:
+            return
+
+        self._start_rescan(ip)
+
+    def _start_rescan(self, ip: str) -> None:
+        # Create a temporary engine with current settings
+        engine = ScannerEngine(
+            num_process=1,
+            num_run=self.num_run.value(),
+            flag_fqdn=self.fqdn_cb.isChecked(),
+            flag_arp=self.arp_cb.isChecked(),
+            flag_vendor=self.vendor_cb.isChecked(),
+        )
+
+        def run():
+            res = engine.scan_one(ip)
+            # We must update the model on the Qt thread.
+            # Using Qt signal would be cleaner, but we keep it simple with a queued call.
+            self.worker = None
+            self._invoke_on_qt(lambda: self.model.upsert(res))
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+
+    def _invoke_on_qt(self, fn):
+        # A tiny helper: use a single-shot timer via Qt event loop.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, fn)
+
+    def on_save(self) -> None:
+        if self.scan_running or not self.net_info:
+            QMessageBox.information(self, self.i18n.tr("app_title"), self.i18n.tr("msg_save_not_ready"))
+            return
+
+        db_path, _ = QFileDialog.getSaveFileName(self, self.i18n.tr("db_save"), "", "SQLite (*.sqlite *.db);;All files (*)")
+        if not db_path:
+            return
+
+        conn = dbmod.connect(db_path)
+        dbmod.init_db(conn)
+
+        rows = []
+        for r in self.model.rows():
+            rows.append(dbmod.ScanRow(
+                ip=r.ip,
+                alive=int(bool(r.alive)),
+                fqdn=r.fqdn or "",
+                mac=r.mac or "",
+                vendor=r.vendor or "",
+            ))
+
+        scan_id = dbmod.insert_scan(
+            conn,
+            title=self.title_edit.text().strip() or "",
+            network_cidr=self.net_info.network_cidr,
+            ip_start=self.net_info.ip_start,
+            ip_stop=self.net_info.ip_stop,
+            broadcast=self.net_info.broadcast,
+            started_at=self.scan_started_at or self.start_time.text(),
+            ended_at=self.scan_ended_at or self.end_time.text(),
+            num_process=self.num_process.value(),
+            num_run=self.num_run.value(),
+            flag_fqdn=self.fqdn_cb.isChecked(),
+            flag_arp=self.arp_cb.isChecked(),
+            flag_vendor=self.vendor_cb.isChecked(),
+            rows=rows,
+        )
+        conn.close()
+        # Keep it silent/minimal
+
+    def on_load(self) -> None:
+        db_path, _ = QFileDialog.getOpenFileName(self, self.i18n.tr("db_open"), "", "SQLite (*.sqlite *.db);;All files (*)")
+        if not db_path:
+            return
+
+        conn = dbmod.connect(db_path)
+        dbmod.init_db(conn)
+        scans = dbmod.list_scans(conn)
+        if not scans:
+            conn.close()
+            QMessageBox.information(self, self.i18n.tr("app_title"), self.i18n.tr("msg_load_empty"))
+            return
+
+        items = [f"{s.title} | {s.started_at}" for s in scans]
+        choice, ok = QInputDialog.getItem(self, self.i18n.tr("scan_select"), self.i18n.tr("scan"), items, 0, False)
+        if not ok or not choice:
+            conn.close()
+            return
+
+        idx = items.index(choice)
+        scan_id = scans[idx].id
+        header, data = dbmod.load_scan(conn, scan_id)
+        conn.close()
+
+        # Populate GUI
         self.title_edit.setText(header.title)
-        self.summary_edit.setText(header.summary)
-        self.net_edit.setText(header.network)
-        self.net_info.setText(f"{header.ip_start}  |  {header.ip_stop}  |  {header.broadcast}")
+        self.net_edit.setText(header.network_cidr)
+        self.net_info = parse_network(header.network_cidr)
+        self.net_info_edit.setText(self.i18n.tr("net_info", start=header.ip_start, stop=header.ip_stop, broadcast=header.broadcast))
         self.start_time.setText(header.started_at)
-        self.end_time.setText(header.finished_at)
+        self.end_time.setText(header.ended_at)
+        self.scan_started_at = header.started_at
+        self.scan_ended_at = header.ended_at
+
         self.num_process.setValue(header.num_process)
         self.num_run.setValue(header.num_run)
-        self.flag_fqdn.setChecked(bool(header.flag_fqdn))
-        self.flag_arp.setChecked(bool(header.flag_arp))
-        self.flag_vendor.setChecked(bool(header.flag_vendor))
+        self.fqdn_cb.setChecked(bool(header.flag_fqdn))
+        self.arp_cb.setChecked(bool(header.flag_arp))
+        self.vendor_cb.setChecked(bool(header.flag_vendor))
 
-        for r in rows:
-            self._on_host(r)
-        self.save_btn.setEnabled(True)
+        # Load results in numeric IP order
+        results: List[HostResult] = []
+        for r in data:
+            results.append(HostResult(ip=r.ip, alive=bool(r.alive), fqdn=r.fqdn, mac=r.mac, vendor=r.vendor))
+
+        # Sort by numeric IP before showing
+        results.sort(key=lambda x: int(__import__("ipaddress").IPv4Address(x.ip)))
+        self.model.bulk_set_in_ip_order(results)
+        self.table.sortByColumn(0, Qt.AscendingOrder)
+
+        self.save_btn.setEnabled(True)  # loaded scan is already finished

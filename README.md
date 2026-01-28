@@ -1,26 +1,72 @@
-# Scanmylan is a simple but powerfull utility that help user to scan for host availability
-# It work with PySide6 (gui) and OS ping
+# ScanMyLan (PySide6)
+
+**ScanMyLan** is a simple but powerful utility designed to scan a local network and check host availability using the **operating system ping** (via subprocess).  
+It is fully cross-platform and works on:
+
+- ✅ **GUI with PySide6**
+- ✅ **Automatic CLI mode**
+- ✅ Windows / Linux
+
+Optional features included:
+
+- **FQDN resolution** (`socket.gethostbyaddr`)
+- **ARP / MAC address lookup**
+  - Windows: `arp -a`
+  - Linux: `/proc/net/arp`
+- **Vendor lookup** through the *macvendorlookup.com* API
+
+---
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+---
 
 ## Run (GUI)
+
 ```bash
 python main.py
 # or
 python main_gui.py
 ```
 
+---
+
 ## Run (CLI)
+
+Automatic scan, output printed with tabulate, and results saved into a database:
+
 ```bash
-python main.py --network 192.168.88.0/24 --dbfile scans.sqlite --title "Scan office"
+python main.py --network 192.168.1.0/24 --dbfile scans.sqlite --title "Office scan"
 ```
 
-CTRL+C during CLI: complete stops , **not save**.
+---
 
-## Input network
-Only IPv4 CIDR (es. `192.168.88.0/24`). A single IP will be handled as `/32`.
+## Stop Execution
 
-## Pipeline
-A) Ping (process concurrency `num_process`)  
+During CLI execution:
+
+- `CTRL+C` immediately stops everything  
+- **No data will be saved into the database**
+
+---
+
+## Network Input
+
+Only IPv4 CIDR format is supported:
+
+- Example: `192.168.88.0/24`
+- A single IP address is automatically treated as `/32`
+
+---
+
+## Scan Pipeline
+
+A) Ping concurrency (`num_process`)  
 B) Retry per IP (`num_run`)  
-C) FQDN (only alive)  
-D) ARP (only alive)  
-E) Vendor (only alive with MAC present)
+C) FQDN resolution *(only for alive hosts)*  
+D) ARP/MAC lookup *(only for alive hosts)*  
+E) Vendor lookup *(only for alive hosts with MAC available)*  

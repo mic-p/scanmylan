@@ -1,0 +1,162 @@
+{
+  "app_title": {
+    "en": "LAN Scanner",
+    "it": "Scanner LAN"
+  },
+  "title": {
+    "en": "Title",
+    "it": "Titolo"
+  },
+  "ethernet": {
+    "en": "Ethernet",
+    "it": "Ethernet"
+  },
+  "network": {
+    "en": "Network (CIDR)",
+    "it": "Network (CIDR)"
+  },
+  "calculate": {
+    "en": "Calculate",
+    "it": "Calcola"
+  },
+  "net_info": {
+    "en": "IP start: {start}   IP stop: {stop}   Broadcast: {broadcast}",
+    "it": "IP start: {start}   IP stop: {stop}   Broadcast: {broadcast}"
+  },
+  "start": {
+    "en": "Start",
+    "it": "Start"
+  },
+  "stop": {
+    "en": "Stop",
+    "it": "Stop"
+  },
+  "start_time": {
+    "en": "Start time",
+    "it": "Ora inizio"
+  },
+  "end_time": {
+    "en": "End time",
+    "it": "Ora fine"
+  },
+  "num_process": {
+    "en": "Concurrent processes",
+    "it": "Processi concorrenti"
+  },
+  "num_run": {
+    "en": "Ping retries",
+    "it": "Tentativi ping"
+  },
+  "options": {
+    "en": "Options",
+    "it": "Opzioni"
+  },
+  "opt_fqdn": {
+    "en": "FQDN",
+    "it": "FQDN"
+  },
+  "opt_arp": {
+    "en": "ARP",
+    "it": "ARP"
+  },
+  "opt_vendor": {
+    "en": "Vendor",
+    "it": "Vendor"
+  },
+  "opt_only_alive": {
+    "en": "Show only alive",
+    "it": "Mostra solo vivi"
+  },
+  "search": {
+    "en": "Search",
+    "it": "Cerca"
+  },
+  "search_text": {
+    "en": "Text",
+    "it": "Testo"
+  },
+  "do_search": {
+    "en": "Search",
+    "it": "Cerca"
+  },
+  "reset": {
+    "en": "Reset",
+    "it": "Reset"
+  },
+  "save": {
+    "en": "Save",
+    "it": "Salva"
+  },
+  "load": {
+    "en": "Load",
+    "it": "Carica"
+  },
+  "db_select": {
+    "en": "Select database file",
+    "it": "Seleziona file database"
+  },
+  "db_open": {
+    "en": "Open database",
+    "it": "Apri database"
+  },
+  "db_save": {
+    "en": "Save to database",
+    "it": "Salva su database"
+  },
+  "scan_select": {
+    "en": "Select a scan",
+    "it": "Seleziona una scansione"
+  },
+  "scan": {
+    "en": "Scan",
+    "it": "Scansione"
+  },
+  "ip_address": {
+    "en": "IP address",
+    "it": "IP address"
+  },
+  "fqdn_col": {
+    "en": "FQDN",
+    "it": "FQDN"
+  },
+  "arp_col": {
+    "en": "ARP (MAC)",
+    "it": "ARP (MAC)"
+  },
+  "vendor_col": {
+    "en": "Vendor",
+    "it": "Vendor"
+  },
+  "msg_invalid_network_title": {
+    "en": "Invalid network",
+    "it": "Network non valida"
+  },
+  "msg_invalid_network_body": {
+    "en": "Please enter a valid IPv4 network in CIDR format (e.g. 192.168.1.0/24).",
+    "it": "Inserisci una network IPv4 valida in formato CIDR (es. 192.168.1.0/24)."
+  },
+  "msg_scan_running": {
+    "en": "Scan already running.",
+    "it": "Scansione già in esecuzione."
+  },
+  "msg_scan_done": {
+    "en": "Scan completed.",
+    "it": "Scansione completata."
+  },
+  "msg_scan_stopped": {
+    "en": "Scan stopped.",
+    "it": "Scansione interrotta."
+  },
+  "msg_save_not_ready": {
+    "en": "You can save only after the scan completes.",
+    "it": "Puoi salvare solo a scansione conclusa."
+  },
+  "msg_load_empty": {
+    "en": "No scans found in this database.",
+    "it": "Nessuna scansione trovata in questo database."
+  },
+  "context_rescan": {
+    "en": "Re-scan",
+    "it": "Re-scan"
+  }
+}
