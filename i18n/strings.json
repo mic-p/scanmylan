@@ -4,6 +4,7 @@
     "title": "Title",
     "network": "Ethernet",
     "calculate": "Calculate",
+    "read_net": "Read net",
     "cidr_calc": "CIDR calculation",
     "cidr_default": "IP start: 0.0.0.0 | IP stop: 0.0.0.0 | Broadcast: 0.0.0.0",
     "start": "Start",
@@ -30,13 +31,18 @@
     "context_rescan": "Re-scan",
     "export_csv": "Export CSV",
     "msg_no_rows": "No rows to export.",
-    "msg_export_ok": "CSV exported successfully."
+    "msg_export_ok": "CSV exported successfully.",
+    "net_select_title": "Select a network",
+    "net_none_found": "No active IPv4 network found.",
+    "net_select_ok": "Use selected",
+    "net_select_cancel": "Cancel"
   },
   "it": {
     "app_title": "Scanner LAN",
     "title": "Titolo",
     "network": "Ethernet",
     "calculate": "Calcola",
+    "read_net": "Leggi net",
     "cidr_calc": "Calcolo CIDR",
     "cidr_default": "IP start: 0.0.0.0 | IP stop: 0.0.0.0 | Broadcast: 0.0.0.0",
     "start": "Start",
@@ -60,6 +66,13 @@
     "msg_scan_not_finished": "Puoi salvare solo a scansione conclusa.",
     "msg_no_db_selected": "Nessun file DB selezionato.",
     "msg_load_choose_scan": "Scegli una scansione da caricare",
-    "context_rescan": "Re-scan"
+    "context_rescan": "Re-scan",
+    "export_csv": "Esporta CSV",
+    "msg_no_rows": "Nessuna riga da esportare.",
+    "msg_export_ok": "CSV esportato correttamente.",
+    "net_select_title": "Seleziona una rete",
+    "net_none_found": "Nessuna rete IPv4 attiva trovata.",
+    "net_select_ok": "Usa selezionata",
+    "net_select_cancel": "Annulla"
   }
 }

@@ -27,9 +27,11 @@ from PySide6.QtWidgets import (
 
 from i18n.i18n import tr, get_lang
 from lib.netcalc import parse_network, NetInfo
+from lib.localnets import list_local_ipv4_networks
 from lib.scanner import LanScanner, ScanConfig, ScanResult
 from lib import db as dbmod
 from .table_model import ResultsModel, ResultsProxy, Row
+from .net_select_dialog import NetSelectDialog
 
 
 class ScannerSignals(QObject):
@@ -60,6 +62,9 @@ class MainWindow(QMainWindow):
         self.net_edit = QLineEdit()
         self.calc_btn = QPushButton(tr("calculate", self.lang))
         self.calc_btn.clicked.connect(self.on_calculate)
+
+        self.read_net_btn = QPushButton(tr("read_net", self.lang))
+        self.read_net_btn.clicked.connect(self.on_read_net)
 
         self.cidr_label = QLabel(tr("cidr_calc", self.lang))
         self.cidr_info = QLineEdit(tr("cidr_default", self.lang))
@@ -154,6 +159,7 @@ class MainWindow(QMainWindow):
         rb.addWidget(QLabel(tr("network", self.lang)))
         rb.addWidget(self.net_edit, 1)
         rb.addWidget(self.calc_btn)
+        rb.addWidget(self.read_net_btn)
         v.addLayout(rb)
 
         # Row c: cidr calculation label + field
@@ -234,6 +240,17 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", tr("msg_invalid_net", self.lang))
             self._netinfo = None
             self.cidr_info.setText(tr("cidr_default", self.lang))
+
+    def on_read_net(self) -> None:
+        nets = list_local_ipv4_networks()
+        if not nets:
+            QMessageBox.information(self, "Info", tr("net_none_found", self.lang))
+            return
+        dlg = NetSelectDialog(nets=nets, lang=self.lang, parent=self)
+        if dlg.exec() == QDialog.Accepted and dlg.selected is not None:
+            self.net_edit.setText(dlg.selected.network)
+            # Auto-calc to update CIDR info and validate quickly.
+            self.on_calculate()
 
     # -----------------------------
     # Search
